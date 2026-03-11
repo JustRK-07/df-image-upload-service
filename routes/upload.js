@@ -9,15 +9,27 @@ const { UPLOAD_DIR, THUMB_DIR, ORIG_DIR, upload, getExtFromMime } = require('../
 const { saveMeta } = require('../lib/meta');
 const { compressImage, compressPdf } = require('../lib/compress');
 
-// Upload single file
+/**
+ * POST /upload - Single file upload and compression
+ *
+ * Process:
+ * 1. Receive file upload via multer (memory storage)
+ * 2. Generate unique ID and save original file
+ * 3. Compress based on file type (PDF or Image)
+ * 4. Compare sizes and keep original if compressed is larger (smart skip)
+ * 5. Generate thumbnail for images
+ * 6. Save metadata and return results
+ */
 router.post('/upload', upload.single('file'), async (req, res) => {
   try {
+    // Step 1.1: Validate file upload
     if (!req.file) {
       return res.status(400).json({ error: 'No file provided' });
     }
 
+    // Step 1.2: Prepare file metadata
     const file = req.file;
-    const id = uuidv4();
+    const id = uuidv4(); // Generate unique ID for this file
     const ext = path.extname(file.originalname).toLowerCase() || getExtFromMime(file.mimetype);
     const filename = `${id}${ext}`;
     const filepath = path.join(UPLOAD_DIR, filename);
@@ -33,13 +45,19 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       url: `${baseUrl}/files/${filename}`,
     };
 
-    // Save original file
+    // Step 2: Save original file (for preview comparison)
     fs.writeFileSync(path.join(ORIG_DIR, filename), file.buffer);
 
+    // Step 3: Start compression timer (measures compression only, not I/O)
+    const compressionStartTime = Date.now();
+
+    // Step 4: Compress based on file type
     if (file.mimetype === 'application/pdf') {
+      // Step 4.1: PDF Compression using pdf-lib (lossless)
       const { outputBuffer, pageCount, title, author } = await compressPdf(file.buffer);
       fs.writeFileSync(filepath, outputBuffer);
 
+      const compressionTime = Date.now() - compressionStartTime;
       const compressedSize = outputBuffer.length;
       const savingsPercent = originalSize > 0 ? Math.round((1 - compressedSize / originalSize) * 100) : 0;
 
@@ -48,33 +66,61 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       result.savingsPercent = savingsPercent;
       result.size = compressedSize;
       result.pdf = { pageCount, title, author };
+      result.compressionMethod = 'pdf-lib';
+      result.compressionType = 'lossless';
+      result.compressionTime = compressionTime;
     } else {
+      // Step 4.2: Image Compression using sharp (quality: 85, near-lossless)
       const { outputBuffer, metadata } = await compressImage(file.buffer, file.mimetype, 85);
-      fs.writeFileSync(filepath, outputBuffer);
 
       const compressedSize = outputBuffer.length;
       const savingsPercent = originalSize > 0 ? Math.round((1 - compressedSize / originalSize) * 100) : 0;
 
-      // Generate thumbnail
+      // Step 4.3: Smart skip - if compressed is larger, keep original
+      let finalBuffer = outputBuffer;
+      let finalSize = compressedSize;
+      let wasSkipped = false;
+
+      if (compressedSize >= originalSize) {
+        finalBuffer = file.buffer; // Use original instead
+        finalSize = originalSize;
+        wasSkipped = true;
+      }
+
+      // Step 4.4: Save the final file (compressed or original)
+      fs.writeFileSync(filepath, finalBuffer);
+
+      // Step 5: Generate thumbnail (200x200, 70% quality for preview)
       const thumbFilename = `thumb_${filename}`;
       await sharp(file.buffer)
         .resize(200, 200, { fit: 'cover' })
         .jpeg({ quality: 70 })
         .toFile(path.join(THUMB_DIR, thumbFilename));
 
+      const compressionTime = Date.now() - compressionStartTime;
+
+      // Step 5.1: Populate image result metadata
       result.type = 'image';
-      result.compressedSize = compressedSize;
-      result.savingsPercent = savingsPercent;
-      result.size = compressedSize;
+      result.compressedSize = finalSize;
+      result.savingsPercent = wasSkipped ? 0 : savingsPercent;
+      result.size = finalSize;
       result.image = {
         width: metadata.width,
         height: metadata.height,
         format: metadata.format,
       };
       result.thumbnail = `${baseUrl}/files/thumbnails/${thumbFilename}`;
+      result.compressionMethod = 'sharp';
+      result.compressionType = wasSkipped ? 'none (original kept)' : 'near-lossless';
+      result.quality = 85;
+      result.compressionTime = compressionTime;
+      result.compressionSkipped = wasSkipped;
     }
 
+    // Step 6: Save metadata to JSON file for later retrieval
     saveMeta(id, result);
+
+    // Step 7: Return success response with all metadata
     res.json(result);
   } catch (err) {
     console.error('Upload error:', err);
@@ -160,19 +206,36 @@ router.post('/upload/multiple', upload.array('files', 10), async (req, res) => {
       // Save original file
       fs.writeFileSync(path.join(ORIG_DIR, filename), file.buffer);
 
+      const compressionStartTime = Date.now();
+
       if (file.mimetype === 'application/pdf') {
         const { outputBuffer, pageCount, title, author } = await compressPdf(file.buffer);
         fs.writeFileSync(filepath, outputBuffer);
+        const compressionTime = Date.now() - compressionStartTime;
         const compressedSize = outputBuffer.length;
         result.type = 'pdf';
         result.compressedSize = compressedSize;
         result.savingsPercent = originalSize > 0 ? Math.round((1 - compressedSize / originalSize) * 100) : 0;
         result.size = compressedSize;
         result.pdf = { pageCount, title, author };
+        result.compressionMethod = 'pdf-lib';
+        result.compressionType = 'lossless';
+        result.compressionTime = compressionTime;
       } else {
         const { outputBuffer, metadata } = await compressImage(file.buffer, file.mimetype, 85);
-        fs.writeFileSync(filepath, outputBuffer);
         const compressedSize = outputBuffer.length;
+
+        let finalBuffer = outputBuffer;
+        let finalSize = compressedSize;
+        let wasSkipped = false;
+
+        if (compressedSize >= originalSize) {
+          finalBuffer = file.buffer;
+          finalSize = originalSize;
+          wasSkipped = true;
+        }
+
+        fs.writeFileSync(filepath, finalBuffer);
 
         const thumbFilename = `thumb_${filename}`;
         await sharp(file.buffer)
@@ -180,12 +243,19 @@ router.post('/upload/multiple', upload.array('files', 10), async (req, res) => {
           .jpeg({ quality: 70 })
           .toFile(path.join(THUMB_DIR, thumbFilename));
 
+        const compressionTime = Date.now() - compressionStartTime;
+
         result.type = 'image';
-        result.compressedSize = compressedSize;
-        result.savingsPercent = originalSize > 0 ? Math.round((1 - compressedSize / originalSize) * 100) : 0;
-        result.size = compressedSize;
+        result.compressedSize = finalSize;
+        result.savingsPercent = wasSkipped ? 0 : (originalSize > 0 ? Math.round((1 - finalSize / originalSize) * 100) : 0);
+        result.size = finalSize;
         result.image = { width: metadata.width, height: metadata.height, format: metadata.format };
         result.thumbnail = `${baseUrl}/files/thumbnails/${thumbFilename}`;
+        result.compressionMethod = 'sharp';
+        result.compressionType = wasSkipped ? 'none (original kept)' : 'near-lossless';
+        result.quality = 85;
+        result.compressionTime = compressionTime;
+        result.compressionSkipped = wasSkipped;
       }
 
       saveMeta(id, result);

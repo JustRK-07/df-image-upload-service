@@ -10,12 +10,49 @@ const { BATCH_DIR, batchUpload, getMimeFromExt } = require('../lib/constants');
 const { formatBytes } = require('../lib/meta');
 const { compressImage, compressPdf } = require('../lib/compress');
 
+// GET /batch-sample-excel — download sample Excel template
+router.get('/batch-sample-excel', (req, res) => {
+  const samplePath = path.join(__dirname, '..', 'test-data', 'test-batch-online.xlsx');
+  if (!fs.existsSync(samplePath)) {
+    return res.status(404).json({ error: 'Sample file not found' });
+  }
+  res.set({
+    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'Content-Disposition': 'attachment; filename="batch-processing-sample.xlsx"',
+  });
+  res.sendFile(samplePath);
+});
+
+// Cleanup old batch directories (older than 1 hour)
+function cleanupOldBatches() {
+  try {
+    if (!fs.existsSync(BATCH_DIR)) return;
+    const now = Date.now();
+    const oneHour = 60 * 60 * 1000;
+    const dirs = fs.readdirSync(BATCH_DIR);
+
+    dirs.forEach(dir => {
+      const dirPath = path.join(BATCH_DIR, dir);
+      const stat = fs.statSync(dirPath);
+      if (stat.isDirectory() && (now - stat.mtimeMs) > oneHour) {
+        fs.rmSync(dirPath, { recursive: true, force: true });
+        console.log(`Cleaned up old batch directory: ${dir}`);
+      }
+    });
+  } catch (err) {
+    console.error('Error cleaning up old batches:', err);
+  }
+}
+
 // POST /batch-process — upload CSV/Excel, compress all listed files
 router.post('/batch-process', batchUpload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file provided' });
     }
+
+    // Clean up old batch directories before starting
+    cleanupOldBatches();
 
     // Parse the spreadsheet/CSV
     const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
@@ -62,12 +99,19 @@ router.post('/batch-process', batchUpload.single('file'), async (req, res) => {
     let totalCompressed = 0;
     let successCount = 0;
     let failedCount = 0;
+    let skippedCount = 0; // Files skipped due to validation (>2MB)
+    let totalSavingsPercent = 0; // Sum of individual savings percentages
+    let filesWithSavings = 0; // Count of files with savings > 0%
     const fileResults = [];
+    const fileManifest = {}; // Map index to saved filename
 
-    for (let i = 0; i < rows.length; i++) {
-      const filePath = rows[i][pathCol];
+    // Process files in parallel (5 at a time)
+    const BATCH_SIZE = 5;
+
+    const processFile = async (row, index) => {
+      const filePath = row[pathCol];
       const entry = {
-        index: i + 1,
+        index: index + 1,
         filePath,
         status: 'pending',
         type: null,
@@ -76,6 +120,7 @@ router.post('/batch-process', batchUpload.single('file'), async (req, res) => {
         savings: '0%',
         savingsPercent: 0,
         error: null,
+        compressionTime: 0,
       };
 
       try {
@@ -83,20 +128,53 @@ router.post('/batch-process', batchUpload.single('file'), async (req, res) => {
           throw new Error('Empty or invalid file path');
         }
 
-        if (!fs.existsSync(filePath)) {
-          throw new Error('File not found');
+        let buffer;
+        let ext;
+
+        // Check if it's a URL
+        if (filePath.startsWith('http://') || filePath.startsWith('https://')) {
+          // Download from URL
+          const response = await fetch(filePath);
+          if (!response.ok) {
+            throw new Error(`Failed to download: ${response.status} ${response.statusText}`);
+          }
+          const arrayBuffer = await response.arrayBuffer();
+          buffer = Buffer.from(arrayBuffer);
+
+          // Get extension from URL or Content-Type
+          const urlPath = new URL(filePath).pathname;
+          ext = path.extname(urlPath).toLowerCase();
+          if (!ext) {
+            const contentType = response.headers.get('content-type');
+            if (contentType.includes('pdf')) ext = '.pdf';
+            else if (contentType.includes('jpeg') || contentType.includes('jpg')) ext = '.jpg';
+            else if (contentType.includes('png')) ext = '.png';
+          }
+        } else {
+          // Local file path
+          if (!fs.existsSync(filePath)) {
+            throw new Error('File not found');
+          }
+          buffer = fs.readFileSync(filePath);
+          ext = path.extname(filePath).toLowerCase();
         }
 
-        const ext = path.extname(filePath).toLowerCase();
         const mime = getMimeFromExt(ext);
         if (!mime) {
           throw new Error(`Unsupported file type: ${ext}`);
         }
 
-        const buffer = fs.readFileSync(filePath);
         const originalSize = buffer.length;
         entry.originalSize = originalSize;
-        totalOriginal += originalSize;
+
+        // Validate file size: reject files > 2 MB
+        const MAX_FILE_SIZE = 2 * 1024 * 1024; // 2 MB
+        if (originalSize > MAX_FILE_SIZE) {
+          throw new Error(`File too large (${(originalSize / 1024 / 1024).toFixed(2)} MB). Maximum allowed: 2 MB`);
+        }
+
+        // Start compression timer (only measure compression, not download)
+        const compressionStartTime = Date.now();
 
         let outputBuffer;
         if (mime === 'application/pdf') {
@@ -109,41 +187,123 @@ router.post('/batch-process', batchUpload.single('file'), async (req, res) => {
           outputBuffer = result.outputBuffer;
         }
 
-        const compressedSize = outputBuffer.length;
+        // Calculate compression time (excluding download and file I/O)
+        entry.compressionTime = Date.now() - compressionStartTime;
+
+        let compressedSize = outputBuffer.length;
+        let finalBuffer = outputBuffer;
+
+        // Smart skip: if compressed is larger, keep original
+        if (compressedSize >= originalSize) {
+          finalBuffer = buffer;
+          compressedSize = originalSize;
+        }
+
         entry.compressedSize = compressedSize;
-        totalCompressed += compressedSize;
 
         const savingsPercent = originalSize > 0 ? Math.round((1 - compressedSize / originalSize) * 100) : 0;
         entry.savingsPercent = savingsPercent;
         entry.savings = savingsPercent + '%';
         entry.status = 'success';
-        successCount++;
 
-        // Save compressed file into batch dir
-        const outName = path.basename(filePath);
-        fs.writeFileSync(path.join(batchDir, outName), outputBuffer);
+        // Save both original and compressed files into batch dir
+        const sanitizedBasename = path.basename(filePath).replace(/[^a-zA-Z0-9._-]/g, '_');
+        const origName = `${index}_original_${sanitizedBasename}`;
+        const compName = `${index}_compressed_${sanitizedBasename}`;
+
+        fs.writeFileSync(path.join(batchDir, origName), buffer);
+        fs.writeFileSync(path.join(batchDir, compName), finalBuffer);
+
+        entry.originalFilename = origName;
+        entry.compressedFilename = compName;
+
+        return { entry, originalSize, compressedSize, success: true };
       } catch (err) {
         entry.status = 'error';
         entry.error = err.message;
-        failedCount++;
+        entry.compressionTime = 0; // No compression time for failed files
+        return { entry, originalSize: 0, compressedSize: 0, success: false };
       }
+    };
 
-      fileResults.push(entry);
+    // Process in batches of 5 files at a time
+    let processedCount = 0;
+    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+      const batch = rows.slice(i, i + BATCH_SIZE);
+      const promises = batch.map((row, idx) => processFile(row, i + idx));
+      const results = await Promise.all(promises);
+
+      results.forEach(result => {
+        fileResults.push(result.entry);
+        if (result.success) {
+          // Calculate savings percentage for this file
+          const savings = result.originalSize > 0
+            ? Math.round((1 - result.compressedSize / result.originalSize) * 100)
+            : 0;
+
+          // Add to running totals (for byte-based calculation if needed)
+          totalOriginal += result.originalSize;
+          totalCompressed += result.compressedSize;
+
+          // Add to average calculation (sum of percentages)
+          if (savings > 0) {
+            totalSavingsPercent += savings;
+            filesWithSavings++;
+          }
+
+          successCount++;
+        } else {
+          // Check if it's a size validation error
+          if (result.entry.error && result.entry.error.includes('File too large')) {
+            skippedCount++;
+          } else {
+            failedCount++;
+          }
+        }
+        processedCount++;
+      });
+
+      // Log progress
+      console.log(`Batch progress: ${processedCount}/${rows.length} files processed`);
     }
 
-    const totalSavings = totalOriginal > 0 ? Math.round((1 - totalCompressed / totalOriginal) * 100) : 0;
+    // Calculate average savings: sum of percentages / count of files with savings
+    const avgSavings = filesWithSavings > 0 ? Math.round(totalSavingsPercent / filesWithSavings) : 0;
+    const totalSaved = totalOriginal - totalCompressed;
+
+    // Debug logging
+    console.log(`Batch complete: ${successCount} success, ${failedCount} failed, ${skippedCount} skipped`);
+    console.log(`Files with savings: ${filesWithSavings}`);
+    console.log(`Total Original: ${totalOriginal} bytes (${formatBytes(totalOriginal)})`);
+    console.log(`Total Compressed: ${totalCompressed} bytes (${formatBytes(totalCompressed)})`);
+    console.log(`Average Savings: ${avgSavings}% (sum: ${totalSavingsPercent}% / count: ${filesWithSavings})`);
+
+    // Save manifest for preview access
+    const manifest = {};
+    fileResults.forEach(f => {
+      if (f.originalFilename && f.compressedFilename) {
+        manifest[f.index] = {
+          original: f.originalFilename,
+          compressed: f.compressedFilename,
+          type: f.type,
+        };
+      }
+    });
+    fs.writeFileSync(path.join(batchDir, '_manifest.json'), JSON.stringify(manifest, null, 2));
 
     res.json({
       batchId,
       total: rows.length,
       success: successCount,
       failed: failedCount,
+      skipped: skippedCount,
       totalOriginal,
       totalCompressed,
-      totalSavings: totalSavings + '%',
+      totalSavings: avgSavings + '%',
       totalOriginalFormatted: formatBytes(totalOriginal),
       totalCompressedFormatted: formatBytes(totalCompressed),
-      totalSavedFormatted: formatBytes(totalOriginal - totalCompressed),
+      totalSavedFormatted: formatBytes(totalSaved > 0 ? totalSaved : 0),
+      filesWithSavings: filesWithSavings,
       files: fileResults,
     });
   } catch (err) {
@@ -167,10 +327,57 @@ router.get('/batch-download/:batchId', (req, res) => {
 
   archive.pipe(res);
   const files = fs.readdirSync(batchDir);
+  // Only include compressed files in the ZIP (skip originals and manifest)
   for (const file of files) {
-    archive.file(path.join(batchDir, file), { name: file });
+    if (file.startsWith('_') || file.includes('_original_')) {
+      continue; // Skip manifest and original files
+    }
+    // Remove the index prefix for cleaner filenames in ZIP
+    const cleanName = file.replace(/^\d+_compressed_/, '');
+    archive.file(path.join(batchDir, file), { name: cleanName });
   }
   archive.finalize();
+});
+
+// GET /batch-file/:batchId/:index/:type — Get original or compressed file from batch
+// type can be 'original' or 'compressed' (default: compressed)
+router.get('/batch-file/:batchId/:index/:type?', (req, res) => {
+  const batchDir = path.join(BATCH_DIR, req.params.batchId);
+  if (!fs.existsSync(batchDir)) {
+    return res.status(404).json({ error: 'Batch not found' });
+  }
+
+  const manifestPath = path.join(batchDir, '_manifest.json');
+  if (!fs.existsSync(manifestPath)) {
+    return res.status(404).json({ error: 'Manifest not found' });
+  }
+
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+  const index = req.params.index;
+  const type = req.params.type || 'compressed';
+
+  if (!manifest[index]) {
+    return res.status(404).json({ error: 'File not found in manifest' });
+  }
+
+  const fileInfo = manifest[index];
+  const filename = type === 'original' ? fileInfo.original : fileInfo.compressed;
+
+  if (!filename) {
+    return res.status(404).json({ error: `${type} file not found in manifest` });
+  }
+
+  const filepath = path.join(batchDir, filename);
+
+  if (!fs.existsSync(filepath)) {
+    return res.status(404).json({ error: 'File not found on disk' });
+  }
+
+  const ext = path.extname(filename).toLowerCase();
+  const mime = getMimeFromExt(ext);
+
+  res.set('Content-Type', mime || 'application/octet-stream');
+  res.sendFile(filepath);
 });
 
 module.exports = router;

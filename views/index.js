@@ -212,7 +212,6 @@ function getIndexHtml() {
   <div class="container">
     <div class="header">
       <h1>Upload &amp; Compress Service POC</h1>
-      <button class="btn-zip" onclick="window.location.href='/download-code'">&#128230; Download Source Code (.zip)</button>
     </div>
 
     <!-- Tabs -->
@@ -247,6 +246,10 @@ function getIndexHtml() {
       <div class="progress" id="progress"><div class="progress-bar" id="progressBar"></div></div>
 
       <div class="section-title">Uploaded Files</div>
+      <div class="empty" id="filesLoadingState" style="display:block">
+        <div class="spinner" style="margin:0 auto 12px"></div>
+        <p>Loading files...</p>
+      </div>
       <div class="table-wrap" id="tableWrap" style="display:none">
         <table>
           <thead>
@@ -263,19 +266,38 @@ function getIndexHtml() {
           <tbody id="filesBody"></tbody>
         </table>
       </div>
-      <div class="empty" id="emptyState">No files uploaded yet</div>
+      <div class="empty" id="emptyState" style="display:none">No files uploaded yet</div>
     </div>
 
     <!-- ===== Batch Processing Tab ===== -->
     <div class="tab-content" id="tab-batch">
       <div class="key-points">
-        <h3>Batch Processing</h3>
+        <h3>Why Batch Processing?</h3>
+        <p style="margin-bottom:12px;color:#475569;font-size:13px;line-height:1.5;">
+          Batch processing lets you compress <b>multiple files at once</b> automatically. Instead of uploading files one by one,
+          you provide a list of file locations (Excel or CSV), and the system compresses them all in parallel.
+        </p>
+        <h4 style="font-size:13px;font-weight:600;margin-top:12px;margin-bottom:8px;color:#0f172a;">How It Works:</h4>
         <ul>
-          <li>Upload a CSV or Excel file with a <span class="highlight">file_path</span> column</li>
-          <li>Each row should contain an absolute path to a file on the server (JPEG, PNG, or PDF)</li>
-          <li>All files will be compressed using the same logic as single uploads</li>
-          <li>Download all compressed files as a single ZIP archive</li>
+          <li><b>Step 1:</b> Create an Excel/CSV file with a <span class="highlight">file_path</span> column listing your files</li>
+          <li><b>Step 2:</b> File paths can be local server paths OR public URLs (http/https)</li>
+          <li><b>Step 3:</b> Upload the Excel/CSV and we'll compress all files automatically</li>
+          <li><b>Step 4:</b> Download all compressed files as a single ZIP archive</li>
         </ul>
+        <h4 style="font-size:13px;font-weight:600;margin-top:12px;margin-bottom:8px;color:#0f172a;">Features:</h4>
+        <ul>
+          <li>Processes <span class="highlight">5 files in parallel</span> for speed (e.g., 100 files in ~30 seconds)</li>
+          <li>Same compression quality as single uploads (quality: 85, near-lossless)</li>
+          <li>Shows detailed results: success/failed status, savings per file, compression time</li>
+          <li>Supports images (JPEG/PNG) and PDFs up to <span class="highlight">2 MB each</span></li>
+          <li>Preview any compressed file before downloading</li>
+        </ul>
+        <div style="margin-top:12px">
+          <button onclick="window.location.href='/batch-sample-excel'" style="background:#10b981;color:#fff;border:none;padding:8px 16px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 1px 3px rgba(0,0,0,0.1)">
+            ⬇ Download Sample Excel Template
+          </button>
+          <span style="margin-left:12px;font-size:12px;color:#64748b;">See example format with 23 test files</span>
+        </div>
       </div>
 
       <div class="batch-upload-area" id="batchDropZone">
@@ -328,16 +350,22 @@ function getIndexHtml() {
               <th>Original Size</th>
               <th>Compressed Size</th>
               <th>Savings</th>
+              <th>Time</th>
               <th>Error</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody id="batchBody"></tbody>
         </table>
       </div>
 
-      <button class="btn-batch-dl" id="batchDownloadBtn" style="display:none" disabled>Download All Compressed (ZIP)</button>
+      <div style="display:flex;gap:12px;margin-top:16px">
+        <button class="btn-batch-dl" id="batchDownloadBtn" style="display:none;margin:0" disabled>Download All Compressed (ZIP)</button>
+        <button class="btn-batch-dl" id="batchDownloadCsvBtn" style="display:none;margin:0;background:#0ea5e9" onclick="downloadBatchCsv()">Download Results (CSV)</button>
+      </div>
       <div class="empty" id="batchEmptyState">Upload a CSV/Excel to start batch processing</div>
     </div>
+
   </div>
 
   <!-- Compare modal -->
@@ -390,6 +418,7 @@ function getIndexHtml() {
     const fileInput = document.getElementById('fileInput');
     const filesBody = document.getElementById('filesBody');
     const emptyState = document.getElementById('emptyState');
+    const filesLoadingState = document.getElementById('filesLoadingState');
     const tableWrap = document.getElementById('tableWrap');
     const progress = document.getElementById('progress');
     const progressBar = document.getElementById('progressBar');
@@ -475,8 +504,8 @@ function getIndexHtml() {
 
     function savingsClass(pct) {
       if (pct == null) return 'savings-neutral';
-      if (pct >= 25) return 'savings-green';
-      if (pct >= 10) return 'savings-yellow';
+      if (pct >= 10) return 'savings-green';
+      if (pct >= 5) return 'savings-yellow';
       return 'savings-red';
     }
 
@@ -506,6 +535,7 @@ function getIndexHtml() {
     }
 
     function renderTable() {
+      filesLoadingState.style.display = 'none';
       if (allFiles.length === 0) {
         emptyState.style.display = 'block';
         tableWrap.style.display = 'none';
@@ -588,7 +618,13 @@ function getIndexHtml() {
       document.getElementById('modalCompSize').textContent = fmtBytes(compSize);
 
       const sClass = savingsClass(savings);
-      document.getElementById('modalSavings').innerHTML = 'Savings: <span class="' + sClass + '">' + savings + '%</span> (' + fmtBytes(origSize - compSize) + ' saved)';
+      const compMethod = f.compressionMethod || 'unknown';
+      const compType = f.compressionType || 'unknown';
+      const quality = f.quality ? ' (quality: ' + f.quality + ')' : '';
+      const compTime = f.compressionTime ? ' | Time: ' + f.compressionTime + 'ms' : '';
+      document.getElementById('modalSavings').innerHTML =
+        'Savings: <span class="' + sClass + '">' + savings + '%</span> (' + fmtBytes(origSize - compSize) + ' saved)<br>' +
+        '<small style="color:#64748b">Method: ' + compMethod + quality + ' | Type: <b>' + compType + '</b>' + compTime + '</small>';
 
       const origEl = document.getElementById('modalOrigContent');
       const compEl = document.getElementById('modalCompContent');
@@ -616,6 +652,45 @@ function getIndexHtml() {
       if (e.target === this) closeCompare();
     });
 
+    function openBatchCompare(index) {
+      const f = currentBatchResults.find(x => x.index === index);
+      if (!f || f.status !== 'success') return;
+
+      const isPdf = f.type === 'PDF';
+      const origSize = f.originalSize || 0;
+      const compSize = f.compressedSize || 0;
+      const savings = f.savingsPercent || 0;
+      const name = f.filePath ? f.filePath.split('/').pop().split('\\\\').pop() : 'unknown';
+
+      document.getElementById('modalTitle').textContent = 'Batch Preview: ' + name;
+      document.getElementById('modalOrigSize').textContent = fmtBytes(origSize);
+      document.getElementById('modalCompSize').textContent = fmtBytes(compSize);
+
+      const sClass = savingsClass(savings);
+      const compTime = f.compressionTime ? ' | Time: ' + f.compressionTime + 'ms' : '';
+      document.getElementById('modalSavings').innerHTML =
+        'Savings: <span class="' + sClass + '">' + savings + '%</span> (' + fmtBytes(origSize - compSize) + ' saved)<br>' +
+        '<small style="color:#64748b">Method: sharp/pdf-lib (quality: 85) | Type: <b>near-lossless</b>' + compTime + '</small>';
+
+      const origEl = document.getElementById('modalOrigContent');
+      const compEl = document.getElementById('modalCompContent');
+
+      // For batch files, we now store both original and compressed
+      const batchOrigUrl = '/batch-file/' + currentBatchId + '/' + index + '/original';
+      const batchCompUrl = '/batch-file/' + currentBatchId + '/' + index + '/compressed';
+
+      if (isPdf) {
+        origEl.innerHTML = '<iframe src="' + batchOrigUrl + '"></iframe>';
+        compEl.innerHTML = '<iframe src="' + batchCompUrl + '"></iframe>';
+      } else {
+        origEl.innerHTML = '<img src="' + batchOrigUrl + '">';
+        compEl.innerHTML = '<img src="' + batchCompUrl + '">';
+      }
+
+      document.getElementById('compareModal').classList.add('active');
+      document.body.style.overflow = 'hidden';
+    }
+
     async function loadFiles() {
       const res = await fetch('/files-list');
       const data = await res.json();
@@ -639,9 +714,11 @@ function getIndexHtml() {
     const batchTableWrap = document.getElementById('batchTableWrap');
     const batchBody = document.getElementById('batchBody');
     const batchDownloadBtn = document.getElementById('batchDownloadBtn');
+    const batchDownloadCsvBtn = document.getElementById('batchDownloadCsvBtn');
     const batchEmptyState = document.getElementById('batchEmptyState');
 
     let currentBatchId = null;
+    let currentBatchResults = null;
 
     batchDropZone.addEventListener('click', () => batchFileInput.click());
     batchDropZone.addEventListener('dragover', e => { e.preventDefault(); batchDropZone.classList.add('drag'); });
@@ -676,14 +753,16 @@ function getIndexHtml() {
       batchSummary.style.display = 'none';
       batchTableWrap.style.display = 'none';
       batchDownloadBtn.style.display = 'none';
+      batchDownloadCsvBtn.style.display = 'none';
 
       // Animate indeterminate progress
       let progressVal = 0;
+      let estimatedFiles = 0;
       const progressInterval = setInterval(() => {
         progressVal = Math.min(progressVal + 2, 90);
         batchProgressFill.style.width = progressVal + '%';
         if (progressVal < 30) batchProgressText.textContent = 'Uploading spreadsheet...';
-        else if (progressVal < 60) batchProgressText.textContent = 'Compressing files...';
+        else if (progressVal < 60) batchProgressText.textContent = 'Compressing files (processing 5 at a time)...';
         else batchProgressText.textContent = 'Almost done...';
       }, 200);
 
@@ -696,13 +775,14 @@ function getIndexHtml() {
 
         clearInterval(progressInterval);
         batchProgressFill.style.width = '100%';
-        batchProgressText.textContent = 'Complete!';
+        batchProgressText.textContent = 'Complete! Processed ' + data.total + ' files (' + data.success + ' successful, ' + data.failed + ' failed)';
 
         if (!res.ok) {
           throw new Error(data.error || 'Batch processing failed');
         }
 
         currentBatchId = data.batchId;
+        currentBatchResults = data.files;
 
         // Populate summary
         document.getElementById('batchTotal').textContent = data.total;
@@ -720,6 +800,13 @@ function getIndexHtml() {
           const statusClass = f.status === 'success' ? 'status-ok' : (f.status === 'error' ? 'status-err' : 'status-pending');
           const statusLabel = f.status === 'success' ? 'OK' : (f.status === 'error' ? 'FAIL' : 'Pending');
           const sClass = f.status === 'success' ? savingsClass(f.savingsPercent) : 'savings-neutral';
+          const timeDisplay = f.compressionTime ? f.compressionTime + 'ms' : '\\u2014';
+          const errorDisplay = f.error
+            ? '<span style="color:#dc2626;font-size:11px;" title="' + escHtml(f.error) + '">' + escHtml(f.error.substring(0, 30)) + (f.error.length > 30 ? '...' : '') + '</span>'
+            : '\\u2014';
+          const actions = f.status === 'success'
+            ? '<button class="btn-sm btn-preview" onclick="openBatchCompare(' + f.index + ')">Preview</button>'
+            : '';
 
           tr.innerHTML =
             '<td>' + f.index + '</td>' +
@@ -729,15 +816,20 @@ function getIndexHtml() {
             '<td class="size-cell">' + (f.originalSize ? fmtBytes(f.originalSize) : '\\u2014') + '</td>' +
             '<td class="size-cell">' + (f.compressedSize ? fmtBytes(f.compressedSize) : '\\u2014') + '</td>' +
             '<td><span class="' + sClass + '">' + (f.status === 'success' ? f.savings : '\\u2014') + '</span></td>' +
-            '<td style="color:#dc2626;font-size:12px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + escHtml(f.error || '') + '">' + escHtml(f.error || '') + '</td>';
+            '<td style="color:#64748b;font-size:12px;">' + timeDisplay + '</td>' +
+            '<td>' + errorDisplay + '</td>' +
+            '<td class="actions-cell">' + actions + '</td>';
           batchBody.appendChild(tr);
         });
         batchTableWrap.style.display = 'block';
 
-        // Show download button
+        // Show download buttons
         if (data.success > 0) {
           batchDownloadBtn.style.display = 'inline-block';
           batchDownloadBtn.disabled = false;
+        }
+        if (data.files.length > 0) {
+          batchDownloadCsvBtn.style.display = 'inline-block';
         }
 
       } catch (err) {
@@ -753,6 +845,45 @@ function getIndexHtml() {
         }, 3000);
       }
     }
+
+    function downloadBatchCsv() {
+      if (!currentBatchResults || currentBatchResults.length === 0) return;
+
+      // Build CSV content
+      const headers = ['#', 'File Path', 'Status', 'Type', 'Original Size (KB)', 'Compressed Size (KB)', 'Savings', 'Time (ms)', 'Error'];
+      const rows = currentBatchResults.map(f => [
+        f.index,
+        f.filePath || '',
+        f.status,
+        f.type || '',
+        f.originalSize ? (f.originalSize / 1024).toFixed(2) : '0',
+        f.compressedSize ? (f.compressedSize / 1024).toFixed(2) : '0',
+        f.savings || '0%',
+        f.compressionTime || '0',
+        f.error || ''
+      ]);
+
+      let csvContent = headers.join(',') + '\\n';
+      rows.forEach(row => {
+        const escaped = row.map(cell => {
+          const str = String(cell).replace(/"/g, '""');
+          return str.includes(',') || str.includes('\\n') || str.includes('"') ? '"' + str + '"' : str;
+        });
+        csvContent += escaped.join(',') + '\\n';
+      });
+
+      // Download as CSV
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'batch-results-' + (currentBatchId || Date.now()) + '.csv';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    }
+
   </script>
 </body>
 </html>`;

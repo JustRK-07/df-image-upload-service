@@ -1,51 +1,10 @@
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
-const archiver = require('archiver');
 const router = express.Router();
 
 const { UPLOAD_DIR, THUMB_DIR, META_DIR, ORIG_DIR } = require('../lib/constants');
 const { loadMeta } = require('../lib/meta');
-
-// Download source code as zip
-router.get('/download-code', (req, res) => {
-  const archive = archiver('zip', { zlib: { level: 9 } });
-  res.set({
-    'Content-Type': 'application/zip',
-    'Content-Disposition': 'attachment; filename="upload-compress-service-poc.zip"',
-  });
-  archive.pipe(res);
-  const projectDir = path.join(__dirname, '..');
-
-  // Root files
-  archive.file(path.join(projectDir, 'server.js'), { name: 'server.js' });
-  archive.file(path.join(projectDir, 'package.json'), { name: 'package.json' });
-  archive.file(path.join(projectDir, 'package-lock.json'), { name: 'package-lock.json' });
-
-  // lib/
-  archive.file(path.join(projectDir, 'lib', 'constants.js'), { name: 'lib/constants.js' });
-  archive.file(path.join(projectDir, 'lib', 'meta.js'), { name: 'lib/meta.js' });
-  archive.file(path.join(projectDir, 'lib', 'compress.js'), { name: 'lib/compress.js' });
-
-  // routes/
-  archive.file(path.join(projectDir, 'routes', 'upload.js'), { name: 'routes/upload.js' });
-  archive.file(path.join(projectDir, 'routes', 'files.js'), { name: 'routes/files.js' });
-  archive.file(path.join(projectDir, 'routes', 'batch.js'), { name: 'routes/batch.js' });
-
-  // views/
-  archive.file(path.join(projectDir, 'views', 'index.js'), { name: 'views/index.js' });
-
-  // test-data/
-  archive.file(path.join(projectDir, 'test-data', 'generate-test-excel.js'), { name: 'test-data/generate-test-excel.js' });
-
-  // Optional root files
-  ['.gitignore', '.env.example', 'Dockerfile', 'Procfile'].forEach(f => {
-    const fp = path.join(projectDir, f);
-    if (fs.existsSync(fp)) archive.file(fp, { name: f });
-  });
-
-  archive.finalize();
-});
 
 // Download original file
 router.get('/download/:id/original', (req, res) => {
@@ -53,7 +12,7 @@ router.get('/download/:id/original', (req, res) => {
   const match = files.find(f => f.startsWith(req.params.id));
   if (!match) {
     const compFiles = fs.readdirSync(UPLOAD_DIR);
-    const compMatch = compFiles.find(f => f.startsWith(req.params.id) && !['thumbnails', 'meta', 'originals', 'batch'].includes(f));
+    const compMatch = compFiles.find(f => f.startsWith(req.params.id) && !['thumbnails', 'meta', 'originals', 'batch', 'code-shares'].includes(f));
     if (!compMatch) return res.status(404).json({ error: 'File not found' });
     const meta = loadMeta(req.params.id);
     const dlName = meta ? meta.originalName : compMatch;
@@ -69,7 +28,7 @@ router.get('/download/:id/original', (req, res) => {
 // Download compressed file
 router.get('/download/:id/compressed', (req, res) => {
   const files = fs.readdirSync(UPLOAD_DIR);
-  const match = files.find(f => f.startsWith(req.params.id) && !['thumbnails', 'meta', 'originals', 'batch'].includes(f));
+  const match = files.find(f => f.startsWith(req.params.id) && !['thumbnails', 'meta', 'originals', 'batch', 'code-shares'].includes(f));
   if (!match) return res.status(404).json({ error: 'File not found' });
   const meta = loadMeta(req.params.id);
   const baseName = meta ? meta.originalName.replace(/(\.[^.]+)$/, '_compressed$1') : match;
@@ -80,7 +39,7 @@ router.get('/download/:id/compressed', (req, res) => {
 // Preview file in browser
 router.get('/preview/:id', (req, res) => {
   const files = fs.readdirSync(UPLOAD_DIR);
-  const match = files.find(f => f.startsWith(req.params.id) && !['thumbnails', 'meta', 'originals', 'batch'].includes(f));
+  const match = files.find(f => f.startsWith(req.params.id) && !['thumbnails', 'meta', 'originals', 'batch', 'code-shares'].includes(f));
   if (!match) return res.status(404).json({ error: 'File not found' });
   res.set('Content-Disposition', 'inline');
   res.sendFile(path.join(UPLOAD_DIR, match));
@@ -101,7 +60,7 @@ router.get('/file/:id', (req, res) => {
   if (meta) return res.json(meta);
 
   const files = fs.readdirSync(UPLOAD_DIR);
-  const match = files.find(f => f.startsWith(req.params.id) && !['thumbnails', 'meta', 'originals', 'batch'].includes(f));
+  const match = files.find(f => f.startsWith(req.params.id) && !['thumbnails', 'meta', 'originals', 'batch', 'code-shares'].includes(f));
   if (!match) return res.status(404).json({ error: 'File not found' });
 
   const filepath = path.join(UPLOAD_DIR, match);
@@ -120,7 +79,7 @@ router.get('/file/:id', (req, res) => {
 // Delete file by id
 router.delete('/file/:id', (req, res) => {
   const files = fs.readdirSync(UPLOAD_DIR);
-  const match = files.find(f => f.startsWith(req.params.id) && !['thumbnails', 'meta', 'originals', 'batch'].includes(f));
+  const match = files.find(f => f.startsWith(req.params.id) && !['thumbnails', 'meta', 'originals', 'batch', 'code-shares'].includes(f));
   if (!match) return res.status(404).json({ error: 'File not found' });
 
   fs.unlinkSync(path.join(UPLOAD_DIR, match));
@@ -141,7 +100,7 @@ router.delete('/file/:id', (req, res) => {
 // List all uploaded files with compression metadata
 router.get('/files-list', (req, res) => {
   const files = fs.readdirSync(UPLOAD_DIR)
-    .filter(f => !['thumbnails', 'meta', 'originals', 'batch'].includes(f))
+    .filter(f => !['thumbnails', 'meta', 'originals', 'batch', 'code-shares'].includes(f))
     .map(f => {
       const id = f.replace(/\.[^.]+$/, '');
       const stat = fs.statSync(path.join(UPLOAD_DIR, f));

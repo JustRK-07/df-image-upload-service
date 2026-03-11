@@ -8,6 +8,7 @@ const getIndexHtml = require('./views/index');
 const uploadRoutes = require('./routes/upload');
 const fileRoutes = require('./routes/files');
 const batchRoutes = require('./routes/batch');
+const codeShareRoutes = require('./routes/code-share');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -29,6 +30,7 @@ app.get('/', (req, res) => {
 app.use(uploadRoutes);
 app.use(fileRoutes);
 app.use(batchRoutes);
+app.use(codeShareRoutes);
 
 // Error handler for multer
 app.use((err, req, res, next) => {
